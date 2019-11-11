@@ -28,7 +28,8 @@
 #include <validation.h>
 #include <validationinterface.h>
 #ifdef ENABLE_WALLET
-#include <wallet/rpcwallet.h>
+#include "wallet/rpcwallet.h"
+#include "wallet/wallet.h"
 #endif
 
 #include <cstdint>
@@ -1330,6 +1331,373 @@ static UniValue testmempoolaccept(const Config &config,
     return result;
 }
 
+#ifdef ENABLE_WALLET
+
+//  currently placeholder to generate big sig ops scripts. currently it's regular script same as createrawtransaction
+class CBigSigOpsScriptVisitor : public boost::static_visitor<bool> {
+private:
+    CScript *script;
+
+public:
+    CBigSigOpsScriptVisitor(CScript *scriptin) { script = scriptin; }
+
+    bool operator()(const CNoDestination &dest) const {
+        script->clear();
+        return false;
+    }
+
+    bool operator()(const CKeyID &keyID) const {
+        script->clear();
+        *script << OP_DUP << OP_HASH160 << ToByteVector(keyID) << OP_EQUALVERIFY
+                << OP_CHECKSIG;
+        return true;
+    }
+
+    bool operator()(const CScriptID &scriptID) const {
+        script->clear();
+        *script << OP_HASH160 << ToByteVector(scriptID) << OP_EQUAL;
+        return true;
+    }
+};
+
+
+CScript GetBigSigOpsScriptForDestination(const CTxDestination &dest) {
+    CScript script;
+
+    boost::apply_visitor(CBigSigOpsScriptVisitor(&script), dest);
+    return script;
+}
+
+class ProgressLogHelper
+{
+public:
+    ProgressLogHelper(uint32_t t, std::string l = "operations")
+        : total(t)
+        , percent(0)
+        , success(false)
+        , label(l)
+    {
+        LogPrintf( "%s start\n", label.c_str());
+    }
+
+    ~ProgressLogHelper()
+    {
+        if(success)
+            LogPrintf( "%s done\n", label.c_str());
+        else
+            LogPrintf( "%s stopped\n", label.c_str());
+    }
+
+    void PrintProgress(uint32_t count)
+    {
+        int newPercent = count * 100 / total;
+        if(newPercent > percent)
+        {
+            percent = newPercent;
+            LogPrintf( "%s progress %d%% (%d/%d)\n", label.c_str(), percent, count, total );
+        }
+    }
+
+    uint32_t total;
+    int percent;
+    bool success;
+    std::string label;
+};
+
+static UniValue fillmempool(const Config &config,
+                                         const JSONRPCRequest &request) {
+    CWallet *const pwallet = GetWalletForJSONRPCRequest(request);
+    if (!EnsureWalletIsAvailable(pwallet, request.fHelp)) {
+        return NullUniValue;
+    }
+
+    if (request.fHelp || request.params.size() > 2) {
+        throw std::runtime_error(
+            "fillmempool\n"
+            "Create random transaction\n "
+            "1. number of target address per transaction\n "
+            "2. maximum transaction count\n "
+            "Returns array of transaction ids\n");
+    }
+
+    int OUTPUT_PER_INPUT = 10;
+    if (request.params.size() > 0 ) {
+        if(request.params[0].isNum())
+        {
+            OUTPUT_PER_INPUT = request.params[0].get_int();
+            if(OUTPUT_PER_INPUT < 1)
+                OUTPUT_PER_INPUT = 1;
+        }
+        else
+        {
+            LogPrintf("Passing non-integer param. value: %s", request.params[0].get_str().c_str());
+        }
+    }
+
+    int maxTxSize = MAX_TX_SIZE;
+    if(request.params.size() > 1)
+    {
+        if(request.params[1].isNum())
+        {
+            maxTxSize = request.params[1].get_int();
+            if(maxTxSize < 1)
+                maxTxSize = 1;
+        }
+        else
+        {
+            LogPrintf("Passing non-integer param. value: %s", request.params[1].get_str().c_str());
+        }        
+    }
+    
+    // Parse the account first so we don't generate a key if there's an error
+    std::string strAccount;
+    if (!pwallet->IsLocked()) {
+        pwallet->TopUpKeyPool();
+    }
+    LOCK2(cs_main, pwallet->cs_wallet);
+    //  =========== get list unspent ====================//
+    
+
+    struct Unspent
+    {
+        std::string txid;
+        uint32_t vout;
+        int64_t satoshis;
+    };
+
+    std::vector<Unspent> unspentList;
+    {
+        bool include_unsafe = true;
+        std::vector<COutput> vecOutputs;
+        assert(pwallet != nullptr);
+        pwallet->AvailableCoins(vecOutputs, !include_unsafe, nullptr);
+        for (const COutput &out : vecOutputs) 
+        {
+            CTxDestination address;
+            const CScript &scriptPubKey = out.tx->tx->vout[out.i].scriptPubKey;
+            bool fValidAddress = ExtractDestination(scriptPubKey, address);
+
+            if(!fValidAddress)
+                continue;
+
+            const Amount& amount = out.tx->tx->vout[out.i].nValue;
+            unspentList.push_back(Unspent{out.tx->GetId().GetHex(), static_cast<uint32_t>(out.i), amount / SATOSHI});
+        }
+    }
+    LogPrintf("Found %d unspent transactions\n", unspentList.size());
+    //  =========== get new address =====================//
+
+    // Generate a new key that is added to wallet
+    std::vector<std::string> addresses;
+    {
+        int totalOut = OUTPUT_PER_INPUT;//unspentList.size() * OUTPUT_PER_INPUT; //  send to 10 address per input
+        ProgressLogHelper a(totalOut, "get new address");
+        for(int i = 0; i < totalOut; ++i)
+        {
+            CPubKey newKey;
+            if (!pwallet->GetKeyFromPool(newKey)) {
+                throw JSONRPCError(
+                    RPC_WALLET_KEYPOOL_RAN_OUT,
+                    "Error: Keypool ran out, please call keypoolrefill first");
+            }
+            CKeyID keyID = newKey.GetID();
+
+            pwallet->SetAddressBook(keyID, strAccount, "receive");
+            addresses.push_back(EncodeDestination(keyID));
+            a.PrintProgress(i);
+        }
+    }
+
+    //  ==================== createrawtransaction ===========================//
+    std::vector<CMutableTransaction> rawHxTxs;
+    {
+        // int startingOutAddress = 0;
+        unsigned int totalTxs = std::min((unsigned int)maxTxSize, (unsigned int)unspentList.size());
+        rawHxTxs.reserve(totalTxs);
+        ProgressLogHelper a(totalTxs, "Create raw transaction");
+
+        unsigned int startingUnspentIdx = 0;
+        CFeeRate minRelayTxFee = config.GetMinFeePerKB();
+        Amount feePerK = minRelayTxFee.GetFeePerK();
+        const int assumedTxoutPerKb = 20;
+        int64_t relayFeePerTxout = std::max((int64_t)200, OUTPUT_PER_INPUT * feePerK / assumedTxoutPerKb / SATOSHI);
+
+        while(startingUnspentIdx < unspentList.size() && rawHxTxs.size() < totalTxs)
+        {
+            int64_t satoshisPerDest = -1;
+            int64_t totalUnspent = 0;
+            int unspentCount = 0;
+            while(satoshisPerDest < 10000 && startingUnspentIdx + unspentCount < unspentList.size())
+            {
+                int currIdx = startingUnspentIdx + unspentCount;
+                auto& unspent = unspentList[currIdx];
+                totalUnspent += unspent.satoshis;
+                satoshisPerDest = (totalUnspent / OUTPUT_PER_INPUT) - relayFeePerTxout;
+                ++unspentCount;
+            }
+
+            if(satoshisPerDest < 10000)
+                break;
+            // LogPrintf( "Create raw transaction - satoshisPerDest: %ld\n", satoshisPerDest );
+
+            CMutableTransaction rawTx;
+            for(int i = 0; i < unspentCount; ++i)
+            {
+                int currIdx = startingUnspentIdx + i;
+                auto& unspent = unspentList[currIdx];
+                uint256 txid;
+                txid.SetHex(unspent.txid);
+                CTxIn in(COutPoint(txid, unspent.vout), CScript(), std::numeric_limits<uint32_t>::max());
+                rawTx.vin.push_back(in);
+            }
+
+            Amount nAmount = satoshisPerDest * SATOSHI;
+
+            std::set<CTxDestination> destinations;
+            // int endOutput = startingOutAddress + OUTPUT_PER_INPUT;
+            for(int i = 0; i < OUTPUT_PER_INPUT; ++i)
+            {
+                const auto& name_ = addresses[i];
+                CTxDestination destination = DecodeDestination(name_, config.GetChainParams());
+                if (!IsValidDestination(destination)) {
+                    throw JSONRPCError(RPC_INVALID_ADDRESS_OR_KEY,
+                                        std::string("Invalid Bitcoin address: ") + name_);
+                }
+
+                if (!destinations.insert(destination).second) {
+                    throw JSONRPCError( RPC_INVALID_PARAMETER, 
+                        std::string("Invalid parameter, duplicated address: ") + name_);
+                }
+
+                CScript scriptPubKey = GetBigSigOpsScriptForDestination(destination);
+
+                CTxOut out(nAmount, scriptPubKey);
+                rawTx.vout.push_back(out);
+            }
+
+            rawHxTxs.push_back(rawTx);
+            startingUnspentIdx += unspentCount;
+            a.PrintProgress(startingUnspentIdx);
+        }
+    }
+
+
+    //  ======================= Sign transactions =================================//
+    LogPrintf( "Signing transactions\n");
+    {
+        int counter = 0;
+        const CKeyStore& keystore = *pwallet;
+        SigHashType sigHashType = SigHashType().withForkId();
+        ProgressLogHelper a(rawHxTxs.size(), "Signing transactions");
+
+        for(CMutableTransaction& tx : rawHxTxs)
+        {
+            CCoinsView viewDummy;
+            CCoinsViewCache view(&viewDummy);
+            {
+                LOCK(g_mempool.cs);
+                CCoinsViewCache &viewChain = *pcoinsTip;
+                CCoinsViewMemPool viewMempool(&viewChain, g_mempool);
+                // Temporarily switch cache backend to db+mempool view.
+                view.SetBackend(viewMempool);
+
+                for (const CTxIn &txin : tx.vin) {
+                    // Load entries from viewChain into view; can fail.
+                    view.AccessCoin(txin.prevout);
+                }
+
+                // Switch back to avoid locking mempool for too long.
+                view.SetBackend(viewDummy);
+            }
+
+            const CTransaction txConst(tx);
+
+            UniValue vErrors(UniValue::VARR);
+            for (size_t i = 0; i < tx.vin.size(); i++) 
+            {
+                CTxIn &txin = tx.vin[i];
+                const Coin &coin = view.AccessCoin(txin.prevout);
+                if (coin.IsSpent()) {
+                    TxInErrorToJSON(txin, vErrors, "Input not found or already spent");
+                    continue;
+                }
+
+                const CScript &prevPubKey = coin.GetTxOut().scriptPubKey;
+                const Amount amount = coin.GetTxOut().nValue;
+
+                SignatureData sigdata;
+                // Only sign SIGHASH_SINGLE if there's a corresponding output:
+                if ((sigHashType.getBaseType() != BaseSigHashType::SINGLE) ||
+                    (i < tx.vout.size())) {
+                    ProduceSignature(MutableTransactionSignatureCreator(
+                                            &keystore, &tx, i, amount, sigHashType),
+                                        prevPubKey, sigdata);
+                }
+
+                UpdateTransaction(tx, i, sigdata);
+
+                ScriptError serror = SCRIPT_ERR_OK;
+                if (!VerifyScript(
+                        txin.scriptSig, prevPubKey, STANDARD_SCRIPT_VERIFY_FLAGS,
+                        TransactionSignatureChecker(&txConst, i, amount), &serror)) {
+                    TxInErrorToJSON(txin, vErrors, ScriptErrorString(serror));
+                }
+            }
+            ++counter;
+            a.PrintProgress(counter);
+        }
+        a.success = true;
+    }
+
+    UniValue result(UniValue::VARR);
+    Amount nMaxRawTxFee = maxTxFee;
+    //  ================================ send transaction ==================================//
+    {
+
+        ProgressLogHelper a(rawHxTxs.size(), "Submitting transactions");
+
+        int count = 0;
+        for(CMutableTransaction& mtx : rawHxTxs)
+        {
+            CTransactionRef tx(MakeTransactionRef(std::move(mtx)));
+            const uint256 &txid = tx->GetId();
+
+            CValidationState state;
+            bool fLimitFree = false;
+            bool fMissingInputs = false;
+            if (!AcceptToMemoryPool(config, g_mempool, state, std::move(tx),
+                                    fLimitFree, &fMissingInputs, false,
+                                    nMaxRawTxFee)) {
+                if (state.IsInvalid()) {
+                    throw JSONRPCError(RPC_TRANSACTION_REJECTED,
+                                    strprintf("%i: %s", state.GetRejectCode(),
+                                                state.GetRejectReason()));
+                } else {
+                    if (fMissingInputs) {
+                        throw JSONRPCError(RPC_TRANSACTION_ERROR, "Missing inputs");
+                    }
+
+                    throw JSONRPCError(RPC_TRANSACTION_ERROR,
+                                    state.GetRejectReason());
+                }
+            }
+
+            result.push_back(txid.GetHex());
+            CInv inv(MSG_TX, txid);
+            g_connman->ForEachNode([&inv](CNode *pnode) { pnode->PushInventory(inv); });
+            ++count;
+            a.PrintProgress(count);
+
+        }
+        a.success = true;
+    }
+
+    return result;
+}
+
+#endif //   ENABLE_WALLET
+
+
 // clang-format off
 static const ContextFreeRPCCommand commands[] = {
     //  category            name                         actor (function)           argNames
@@ -1343,6 +1711,9 @@ static const ContextFreeRPCCommand commands[] = {
     { "rawtransactions",    "signrawtransactionwithkey", signrawtransactionwithkey, {"hexstring","privkeys","prevtxs","sighashtype"} },
     { "rawtransactions",    "testmempoolaccept",         testmempoolaccept,         {"rawtxs","allowhighfees"} },
 
+#ifdef ENABLE_WALLET
+    { "rawtransactions",    "fillmempool",               fillmempool,               {"outputcount"} }, 
+#endif
     { "blockchain",         "gettxoutproof",             gettxoutproof,             {"txids", "blockhash"} },
     { "blockchain",         "verifytxoutproof",          verifytxoutproof,          {"proof"} },
 };

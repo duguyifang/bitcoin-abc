@@ -82,6 +82,9 @@ fs::path GetDefaultDataDir();
 const fs::path &GetBlocksDir();
 const fs::path &GetDataDir(bool fNetSpecific = true);
 void ClearDatadirCache();
+fs::path GetblocktemplatelightDataDir();
+fs::path GetblocktemplatelightDataTrashDir();
+int GetblocktemplatelightCacheSize();
 fs::path GetConfigFile(const std::string &confPath);
 #ifndef WIN32
 fs::path GetPidFile();

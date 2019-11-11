@@ -27,11 +27,18 @@
 #include <validation.h>
 #include <validationinterface.h>
 #include <warnings.h>
+#include "consensus/activation.h"
 
 #include <univalue.h>
 
 #include <cstdint>
 #include <memory>
+
+#include <fs.h>
+
+std::unordered_map<std::string, std::vector<CTransactionRef>> gGetblocktemplatelightCacheMap;   //  keep the transactions based on the job_id
+std::vector<std::string> gGetblocktemplatelightIdList;  //  keep the job_id order
+CCriticalSection cs_getblocktemplatelight;
 
 /**
  * Return average network hashes per second based on the last 'lookup' blocks,
@@ -329,9 +336,40 @@ static UniValue BIP22ValidationResult(const Config &config,
     return "valid?";
 }
 
-static UniValue getblocktemplate(const Config &config,
+static void makeMerkleBranch(const std::vector<uint256> &vtxhashs, std::vector<uint256> &steps)
+{
+  if (vtxhashs.size() == 0)
+  {
+    return;
+  }
+  std::vector<uint256> hashs(vtxhashs.begin(), vtxhashs.end());
+  while (hashs.size() > 1)
+  {
+    // put first element
+    steps.push_back(*hashs.begin());
+    if (hashs.size() % 2 == 0)
+    {
+      // if even, push_back the end one, size should be an odd number.
+      // because we ignore the coinbase tx when make merkle branch.
+      hashs.push_back(*hashs.rbegin());
+    }
+    // ignore the first one than merge two
+    for (size_t i = 0; i < (hashs.size() - 1) / 2; i++)
+    {
+      // Hash = Double SHA256
+      hashs[i] = Hash(BEGIN(hashs[i * 2 + 1]), END(hashs[i * 2 + 1]),
+                      BEGIN(hashs[i * 2 + 2]), END(hashs[i * 2 + 2]));
+    }
+    hashs.resize((hashs.size() - 1) / 2);
+  }
+  assert(hashs.size() == 1);
+  steps.push_back(*hashs.begin()); // put the last one
+}
+
+static UniValue getblocktemplatecommon(bool lightVersion, const Config &config,
                                  const JSONRPCRequest &request) {
-    if (request.fHelp || request.params.size() > 1) {
+    bool wrongParamSize = lightVersion ? request.params.size() > 2 : request.params.size() > 1;
+    if (request.fHelp || wrongParamSize) {
         throw std::runtime_error(
             "getblocktemplate ( TemplateRequest )\n"
             "\nIf the request parameters include a 'mode' key, that is used to "
@@ -499,6 +537,22 @@ static UniValue getblocktemplate(const Config &config,
         }
     }
 
+    //  GBTLight only. BTC.COM specific. Inject transactions to be added in the block
+    std::vector<CMutableTransaction> injectTxs;
+    if (lightVersion && request.params.size() > 1) 
+    {
+        const UniValue &injectedTxsHex = request.params[1].get_array();
+        injectTxs.reserve(injectedTxsHex.size());
+        for (unsigned int idx = 0; idx < injectedTxsHex.size(); idx++) 
+        {
+            CMutableTransaction tx;
+            if(DecodeHexTx(tx, injectedTxsHex[idx].get_str()))
+            {
+                injectTxs.push_back(std::move(tx));
+            }
+        }
+    }
+
     if (strMode != "template") {
         throw JSONRPCError(RPC_INVALID_PARAMETER, "Invalid mode");
     }
@@ -583,7 +637,7 @@ static UniValue getblocktemplate(const Config &config,
         // Store the pindexBest used before CreateNewBlock, to avoid races
         nTransactionsUpdatedLast = g_mempool.GetTransactionsUpdated();
         CBlockIndex *pindexPrevNew = chainActive.Tip();
-        nStart = GetTime();
+        //nStart = GetTime();
 
         // Create new block
         CScript scriptDummy = CScript() << OP_TRUE;
@@ -600,6 +654,25 @@ static UniValue getblocktemplate(const Config &config,
     assert(pindexPrev);
     // pointer for convenience
     CBlock *pblock = &pblocktemplate->block;
+    const Consensus::Params &consensusParams =
+       config.GetChainParams().GetConsensus();
+    //  inject BTC.COM extra transactions
+    if(!injectTxs.empty())
+    {
+        for(auto& tx : injectTxs)
+        {
+            pblock->vtx.push_back(MakeTransactionRef(std::move(tx)));            
+        }
+        if (IsMagneticAnomalyEnabled(consensusParams, pindexPrev)) {
+            // If magnetic anomaly is enabled, we make sure transaction are canonically ordered.
+            std::sort(std::begin(pblock->vtx) + 1, std::end(pblock->vtx),
+                    [](const std::shared_ptr<const CTransaction> &a, const std::shared_ptr<const CTransaction> &b) -> bool {
+                        // The hash is a little endian uint8_t[256] in memory, so a < b is ordered by ascending.
+                        return a->GetId() < b->GetId();
+                    });
+        }
+    }
+
 
     // Update nTime
     UpdateTime(pblock, config.GetChainParams().GetConsensus(), pindexPrev);
@@ -608,28 +681,75 @@ static UniValue getblocktemplate(const Config &config,
     UniValue aCaps(UniValue::VARR);
     aCaps.push_back("proposal");
 
+    uint160 jobId;  //  light version
+    UniValue merklebranch(UniValue::VARR);  //  light version
     UniValue transactions(UniValue::VARR);
-    int index_in_template = 0;
-    for (const auto &it : pblock->vtx) {
-        const CTransaction &tx = *it;
-        uint256 txId = tx.GetId();
+    if(lightVersion)
+    {
+        std::vector<uint256> vtxhashsNoCoinbase; // txs without coinbase
+        for (const auto &it : pblock->vtx) {
+            const CTransaction &tx = *it;
+            uint256 txId = tx.GetId();
 
-        if (tx.IsCoinBase()) {
-            index_in_template++;
-            continue;
+            if (tx.IsCoinBase()) {
+                continue;
+            }
+            vtxhashsNoCoinbase.push_back(txId);
+        }        
+        // merkle branch, merkleBranch_ could be empty
+        // make merkleSteps and merkle branch
+        std::vector<uint256> merkleSteps;
+        makeMerkleBranch(vtxhashsNoCoinbase, merkleSteps);
+        for(auto& h : merkleSteps)
+        {
+            merklebranch.push_back(h.GetHex());
         }
 
-        UniValue entry(UniValue::VOBJ);
-        entry.pushKV("data", EncodeHexTx(tx));
-        entry.pushKV("txid", txId.GetHex());
-        entry.pushKV("hash", tx.GetHash().GetHex());
-        entry.pushKV("fee", pblocktemplate->entries[index_in_template].txFee /
-                                SATOSHI);
-        int64_t nTxSigOps = pblocktemplate->entries[index_in_template].txSigOps;
-        entry.pushKV("sigops", nTxSigOps);
+        std::string jobIdHashSource = pblock->hashPrevBlock.GetHex();
+        for(auto& m : merkleSteps)
+        {
+            jobIdHashSource += m.GetHex();        
+        }
 
-        transactions.push_back(entry);
-        index_in_template++;
+        jobId = Hash160(std::vector<uint8_t>({jobIdHashSource.begin(), jobIdHashSource.end()}));
+
+    }
+    else
+    {
+        std::map<uint256, int64_t> setTxIndex;
+        int i = 0;
+        for (const auto &it : pblock->vtx) {
+            const CTransaction &tx = *it;
+            uint256 txId = tx.GetId();
+            setTxIndex[txId] = i++;
+
+            if (tx.IsCoinBase()) {
+                continue;
+            }
+
+            UniValue entry(UniValue::VOBJ);
+
+            entry.pushKV("data", EncodeHexTx(tx));
+            entry.pushKV("txid", txId.GetHex());
+            entry.pushKV("hash", tx.GetHash().GetHex());
+
+            UniValue deps(UniValue::VARR);
+            for (const CTxIn &in : tx.vin) {
+                if (setTxIndex.count(in.prevout.GetTxId())) {
+                    deps.push_back(setTxIndex[in.prevout.GetTxId()]);
+                }
+            }
+            entry.pushKV("depends", deps);
+
+            int index_in_template = i - 1;
+            entry.pushKV("fee",
+                        pblocktemplate->entries[index_in_template].txFee / SATOSHI);
+            int64_t nTxSigOps =
+                pblocktemplate->entries[index_in_template].txSigOps;
+            entry.pushKV("sigops", nTxSigOps);
+
+            transactions.push_back(entry);
+        }
     }
 
     UniValue aux(UniValue::VOBJ);
@@ -639,7 +759,11 @@ static UniValue getblocktemplate(const Config &config,
 
     UniValue aMutable(UniValue::VARR);
     aMutable.push_back("time");
-    aMutable.push_back("transactions");
+    if(!lightVersion)
+    {
+        //  ganibc: Question, is this related to transactions generated above? For now, I assume it is, that's why I only push_back when it's not light version
+        aMutable.push_back("transactions");
+    }
     aMutable.push_back("prevblock");
 
     UniValue result(UniValue::VOBJ);
@@ -648,7 +772,15 @@ static UniValue getblocktemplate(const Config &config,
     result.pushKV("version", pblock->nVersion);
 
     result.pushKV("previousblockhash", pblock->hashPrevBlock.GetHex());
-    result.pushKV("transactions", transactions);
+    if(lightVersion)
+    {
+        result.pushKV("job_id", jobId.GetHex());
+        result.pushKV("merkle", merklebranch);
+    }
+    else
+    {
+        result.pushKV("transactions", transactions);
+    }
     result.pushKV("coinbaseaux", aux);
     result.pushKV("coinbasevalue",
                   int64_t(pblock->vtx[0]->vout[0].nValue / SATOSHI));
@@ -665,8 +797,75 @@ static UniValue getblocktemplate(const Config &config,
     result.pushKV("bits", strprintf("%08x", pblock->nBits));
     result.pushKV("height", int64_t(pindexPrev->nHeight) + 1);
 
+    if(lightVersion)
+    {
+        std::vector<CTransactionRef> storeTxs;
+        auto vtxIterAfterCoinbase = std::next(pblock->vtx.begin());
+        storeTxs.insert(storeTxs.begin(), vtxIterAfterCoinbase, pblock->vtx.end());
+
+        const std::string jobIdStr = jobId.GetHex();
+        fs::path outputFile = GetblocktemplatelightDataDir();
+        outputFile += jobIdStr;
+        if(!fs::exists(outputFile))
+        {
+            CDataStream datastream(SER_DISK, PROTOCOL_VERSION);
+
+            datastream << (uint32_t)storeTxs.size();
+            for (const auto &it : storeTxs) {
+                const CTransaction &tx = *it;
+                datastream << tx;
+            }
+
+            fs::ofstream ofile(outputFile);
+            if(ofile.is_open())
+            {
+                ofile << "GBT";
+                ofile.write(datastream.data(), datastream.size());
+                ofile << "GBT";
+                LogPrintf("getblocktemplatelight written to %s", outputFile.string().c_str());
+            }
+            else
+            {
+                LogPrintf("getblocktemplatelight cannot write tx data to %s", outputFile.string().c_str());
+            }
+        }
+
+        {
+            LOCK(cs_getblocktemplatelight);
+            if((int)gGetblocktemplatelightCacheMap.size() >= GetblocktemplatelightCacheSize()) //  limit the total cache
+            {
+                //  remove the oldest block
+                auto removeJobIdIter = gGetblocktemplatelightIdList.begin();
+                if(jobIdStr != *removeJobIdIter)
+                {
+                    LogPrintf("Cache size exceeded. cache for job_id %s removed\n", (*removeJobIdIter).c_str());
+                    //  if the oldest block not the same as the latest block, then erase.
+                    gGetblocktemplatelightCacheMap.erase(*removeJobIdIter);
+                }
+                gGetblocktemplatelightIdList.erase(removeJobIdIter);
+            }
+            gGetblocktemplatelightIdList.push_back(jobIdStr);
+            gGetblocktemplatelightCacheMap[jobIdStr] = std::move(storeTxs);
+        }
+    }
+
     return result;
 }
+
+
+static UniValue getblocktemplatelight(const Config &config,
+                                 const JSONRPCRequest &request) 
+{
+    return getblocktemplatecommon(true, config, request);    
+}
+
+
+static UniValue getblocktemplate(const Config &config,
+                                 const JSONRPCRequest &request) 
+{
+    return getblocktemplatecommon(false, config, request);    
+}
+
 
 class submitblock_StateCatcher : public CValidationInterface {
 public:
@@ -689,36 +888,85 @@ protected:
     }
 };
 
-static UniValue submitblock(const Config &config,
-                            const JSONRPCRequest &request) {
-    // We allow 2 arguments for compliance with BIP22. Argument 2 is ignored.
-    if (request.fHelp || request.params.size() < 1 ||
-        request.params.size() > 2) {
-        throw std::runtime_error(
-            "submitblock \"hexdata\"  ( \"dummy\" )\n"
-            "\nAttempts to submit new block to network.\n"
-            "See https://en.bitcoin.it/wiki/BIP_0022 for full specification.\n"
 
-            "\nArguments\n"
-            "1. \"hexdata\"        (string, required) the hex-encoded block "
-            "data to submit\n"
-            "2. \"dummy\"          (optional) dummy value, for compatibility "
-            "with BIP22. This value is ignored.\n"
-            "\nResult:\n"
-            "\nExamples:\n" +
-            HelpExampleCli("submitblock", "\"mydata\"") +
-            HelpExampleRpc("submitblock", "\"mydata\""));
-    }
-
+static UniValue submitblockcommon(const std::string& jobId, const Config &config,
+                            const JSONRPCRequest &request) 
+{
+    int64_t submitblockStart = GetTimeMicros();
     std::shared_ptr<CBlock> blockptr = std::make_shared<CBlock>();
     CBlock &block = *blockptr;
     if (!DecodeHexBlk(block, request.params[0].get_str())) {
         throw JSONRPCError(RPC_DESERIALIZATION_ERROR, "Block decode failed");
     }
 
-    if (block.vtx.empty() || !block.vtx[0]->IsCoinBase()) {
-        throw JSONRPCError(RPC_DESERIALIZATION_ERROR,
-                           "Block does not start with a coinbase");
+    auto timeSerializeTx = GetTimeMicros() - submitblockStart;
+    if(!jobId.empty())
+    {
+        if (block.vtx.size() != 1 || !block.vtx[0]->IsCoinBase()) {
+            throw JSONRPCError(RPC_DESERIALIZATION_ERROR,
+                            "Block does not only contain a coinbase (light version)");
+        }
+        bool loadFile = true;
+        {
+            LOCK(cs_getblocktemplatelight);
+            auto iter = gGetblocktemplatelightCacheMap.find(jobId);
+            if(iter != gGetblocktemplatelightCacheMap.end())
+            {
+                auto& vtx = iter->second;
+                block.vtx.insert(block.vtx.end(), vtx.begin(), vtx.end());
+                loadFile = false;
+            }
+        }
+        
+        if(loadFile)
+        {
+            LogPrintf("SubmitBlockLight job_id %s not found in mem cache. Searching from file.\n", jobId.c_str());
+            fs::path filename = GetblocktemplatelightDataDir();
+            filename += jobId;
+            if(!fs::exists(filename))
+            {
+                LogPrintf("[WARNING] SubmitBlockLight cannot find file %s. Searching trash dir.\n", jobId.c_str());
+                filename = GetblocktemplatelightDataTrashDir();
+                filename += jobId;
+            }
+            LogPrintf("SubmitBlockLight job_id %s found in %s.\n", jobId.c_str(), filename.string().c_str());
+            std::vector<char> dataBuff;
+            {
+                fs::ifstream file(filename);
+                if(!file.is_open())
+                {
+                    return "job_id data not available";
+                }
+                file.seekg(0, file.end);
+                int64_t fileSize = (int64_t)file.tellg();
+                auto dataSize = fileSize - 6; // 6 from prefix GBT (3) and postfix GBT (3)
+                if(dataSize <= 0)
+                {
+                    return "job_id data is empty";
+                }
+                file.seekg(3, file.beg);
+                dataBuff.resize(dataSize);
+                file.read(dataBuff.data(), dataSize);
+            }
+            CDataStream c(dataBuff, SER_DISK, PROTOCOL_VERSION);
+            uint32_t txCount = 0;
+            c >> txCount;
+            for(uint32_t i = 0; i < txCount; ++i)
+            {
+                CMutableTransaction mutableTx;
+                c >> mutableTx;
+                block.vtx.push_back(MakeTransactionRef(std::move(mutableTx)));
+            }
+        }
+        timeSerializeTx = GetTimeMicros() - submitblockStart;
+       
+    }
+    else
+    {
+        if (block.vtx.empty() || !block.vtx[0]->IsCoinBase()) {
+            throw JSONRPCError(RPC_DESERIALIZATION_ERROR,
+                            "Block does not start with a coinbase");
+        }        
     }
 
     uint256 hash = block.GetHash();
@@ -750,7 +998,77 @@ static UniValue submitblock(const Config &config,
         return "inconclusive";
     }
 
-    return BIP22ValidationResult(config, sc.state);
+    auto result = BIP22ValidationResult(config, sc.state);
+
+    int64_t submitblockEnd = GetTimeMicros();
+    auto timeLen = submitblockEnd - submitblockStart;
+    if(!jobId.empty())
+    {
+        LogPrintf("SubmitBlockLight serialize txs for job_id %s duration is %f seconds\n", jobId.c_str(), (float)timeSerializeTx * 0.000001f);
+    }
+    LogPrintf("SubmitBlock duration is %f seconds\n", (float)timeLen * 0.000001f);
+
+    return result;
+}
+
+static UniValue submitblock(const Config &config,
+                            const JSONRPCRequest &request) 
+{
+    if (request.fHelp || request.params.size() < 1 ||
+        request.params.size() > 2) {
+        throw std::runtime_error(
+            "submitblock \"hexdata\" ( \"jsonparametersobject\" )\n"
+            "\nAttempts to submit new block to network.\n"
+            "The 'jsonparametersobject' parameter is currently ignored.\n"
+            "See https://en.bitcoin.it/wiki/BIP_0022 for full specification.\n"
+
+            "\nArguments\n"
+            "1. \"hexdata\"        (string, required) the hex-encoded block "
+            "data to submit\n"
+            "2. \"parameters\"     (string, optional) object of optional "
+            "parameters\n"
+            "    {\n"
+            "      \"workid\" : \"id\"    (string, optional) if the server "
+            "provided a workid, it MUST be included with submissions\n"
+            "    }\n"
+            "\nResult:\n"
+            "\nExamples:\n" +
+            HelpExampleCli("submitblock", "\"mydata\"") +
+            HelpExampleRpc("submitblock", "\"mydata\""));
+    }
+    
+    return submitblockcommon("", config, request);
+}
+
+static UniValue submitblocklight(const Config &config,
+                            const JSONRPCRequest &request) 
+{
+    if (request.fHelp || request.params.size() < 2 ||
+        request.params.size() > 3) {
+        throw std::runtime_error(
+            "submitblocklight \"hexdata\" ( \"jsonparametersobject\" )\n"
+            "\nAttempts to submit new block to network.\n"
+            "The 'jsonparametersobject' parameter is currently ignored.\n"
+            "See https://en.bitcoin.it/wiki/BIP_0022 for full specification.\n"
+
+            "\nArguments\n"
+            "1. \"hexdata\"        (string, required) the hex-encoded block "
+            "data to submit\n"
+            "2. \"job_id\"        (string, required) job_id from gbt light\n"
+            "3. \"parameters\"     (string, optional) object of optional "
+            "parameters\n"
+            "    {\n"
+            "      \"workid\" : \"id\"    (string, optional) if the server "
+            "provided a workid, it MUST be included with submissions\n"
+            "    }\n"
+            "\nResult:\n"
+            "\nExamples:\n" +
+            HelpExampleCli("submitblocklight", "\"mydata\"") +
+            HelpExampleRpc("submitblocklight", "\"mydata\""));
+    }
+
+    std::string jobId = request.params[1].get_str();
+    return submitblockcommon(jobId, config, request);
 }
 
 static UniValue submitheader(const Config &config,
@@ -820,7 +1138,9 @@ static const ContextFreeRPCCommand commands[] = {
     {"mining",     "getmininginfo",         getmininginfo,         {}},
     {"mining",     "prioritisetransaction", prioritisetransaction, {"txid", "priority_delta", "fee_delta"}},
     {"mining",     "getblocktemplate",      getblocktemplate,      {"template_request"}},
-    {"mining",     "submitblock",           submitblock,           {"hexdata", "dummy"}},
+    {"mining",     "getblocktemplatelight", getblocktemplatelight, {"template_request"}},
+    {"mining",     "submitblock",           submitblock,           {"hexdata", "parameters"}},
+    {"mining",     "submitblocklight",      submitblocklight,      {"hexdata", "job_id", "parameters"}},
     {"mining",     "submitheader",          submitheader,          {"hexdata"}},
 
     {"generating", "generatetoaddress",     generatetoaddress,     {"nblocks", "address", "maxtries"}},
